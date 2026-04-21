@@ -20,70 +20,34 @@ const cooldown = new Map();
 // ================= HEADERS =================
 const headers = {
   "User-Agent":
-    "com.google.android.youtube/19.09.37 (Linux; U; Android 11)",
-  "Content-Type": "application/json",
-  "Accept": "*/*",
-  "Origin": "https://www.youtube.com",
-  "Referer": "https://www.youtube.com/"
+    "com.google.android.youtube/19.09.37 (Linux; Android 11)",
+  "Content-Type": "application/json"
 };
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ======================================================
-// SAFE JSON PARSER
-// ======================================================
-async function safeJson(res) {
-  const text = await res.text();
-  return JSON.parse(text.replace(/^\)\]\}'\s*\n?/, ""));
-}
-
-// ======================================================
-// LIVE CHAT DETECTION
+// 🔥 FINAL DETECTION (IFRAME METHOD - STABLE)
 // ======================================================
 async function getLiveChatId(videoId) {
   try {
-    let continuation = null;
+    const html = await fetch(
+      `https://www.youtube.com/live_chat?is_popout=1&v=${videoId}`,
+      { headers }
+    ).then(r => r.text());
 
-    // Layer 1: watch page
-    try {
-      const res = await fetch(
-        `https://www.youtube.com/watch?v=${videoId}&pbj=1`,
-        { headers }
-      );
+    const match = html.match(/"continuation":"(.*?)"/);
 
-      const data = await safeJson(res);
-      const blocks = Array.isArray(data) ? data : [data];
+    if (!match?.[1]) return false;
 
-      for (const d of blocks) {
-        continuation =
-          d?.response?.contents?.twoColumnWatchNextResults
-            ?.conversationBar?.liveChatRenderer?.continuations?.[0]
-            ?.reloadContinuationData?.continuation;
-
-        if (continuation) break;
-      }
-    } catch {}
-
-    // Layer 2: HTML fallback
-    if (!continuation) {
-      try {
-        const html = await fetch(
-          `https://www.youtube.com/watch?v=${videoId}`,
-          { headers }
-        ).then(r => r.text());
-
-        const match = html.match(/"continuation":"(.*?)"/);
-
-        if (match?.[1]) continuation = match[1];
-      } catch {}
-    }
-
-    if (!continuation) return false;
+    const continuation = match[1];
 
     liveChats.set(videoId, continuation);
+
     return true;
 
-  } catch {
+  } catch (err) {
+    console.log("detect error:", err.message);
     return false;
   }
 }
@@ -102,7 +66,7 @@ async function waitForChat(videoId) {
       return;
     }
 
-    await sleep(10000);
+    await sleep(5000);
   }
 }
 
@@ -119,7 +83,7 @@ async function notify(user, msg, videoId) {
 }
 
 // ======================================================
-// POLLER (ANDROID FIX APPLIED)
+// POLLER (ANDROID CLIENT)
 // ======================================================
 async function poll(videoId, continuation) {
   let token = continuation;
@@ -146,11 +110,17 @@ async function poll(videoId, continuation) {
 
       const data = await res.json();
 
-      const actions =
-        data?.continuationContents?.liveChatContinuation?.actions || [];
+      const chat = data?.continuationContents?.liveChatContinuation;
 
-      // 🔍 DEBUG
-      console.log("ACTIONS LENGTH:", actions.length);
+      if (!chat) {
+        console.log("⚠️ chat missing, retry...");
+        await sleep(3000);
+        continue;
+      }
+
+      const actions = chat.actions || [];
+
+      console.log("ACTIONS:", actions.length);
 
       for (const a of actions) {
 
@@ -172,26 +142,30 @@ async function poll(videoId, continuation) {
         const user = msg.authorName?.simpleText || "unknown";
         const authorId = msg.authorExternalChannelId;
 
-        // 🔍 DEBUG
         console.log("RAW:", user, authorId, text);
 
-        // FILTER
-        if (!CHANNEL_IDS.includes(authorId)) continue;
+        // FILTER (optional — comment for testing)
+        if (CHANNEL_IDS.length && !CHANNEL_IDS.includes(authorId)) continue;
 
         // anti-spam
         const now = Date.now();
-        if (cooldown.get(authorId) && now - cooldown.get(authorId) < 4000)
+        if (cooldown.get(authorId) && now - cooldown.get(authorId) < 3000)
           continue;
 
         cooldown.set(authorId, now);
 
         console.log(`🎯 MATCH: ${user}: ${text}`);
+
         await notify(user, text, videoId);
       }
 
       token =
-        data?.continuationContents?.liveChatContinuation
-          ?.continuations?.[0]?.timedContinuationData?.continuation;
+        chat?.continuations?.[0]?.timedContinuationData?.continuation;
+
+      if (!token) {
+        console.log("⚠️ token lost, stopping poll");
+        break;
+      }
 
       await sleep(POLL_INTERVAL);
 
