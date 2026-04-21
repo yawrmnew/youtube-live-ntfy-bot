@@ -4,6 +4,7 @@ import express from "express";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ================= CONFIG =================
 const VIDEO_IDS = process.env.TARGET_VIDEO_IDS?.split(",") || [];
 const CHANNEL_IDS = process.env.TARGET_CHANNEL_IDS?.split(",") || [];
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
@@ -36,13 +37,13 @@ async function safeJson(res) {
 }
 
 // ======================================================
-// LAYER 1 + 2 + 3 LIVE CHAT DETECTION
+// LIVE CHAT DETECTION (MULTI FALLBACK)
 // ======================================================
 async function getLiveChatId(videoId) {
   try {
     let continuation = null;
 
-    // ---------------- LAYER 1 ----------------
+    // Layer 1: watch page
     try {
       const res = await fetch(
         `https://www.youtube.com/watch?v=${videoId}&pbj=1`,
@@ -62,35 +63,7 @@ async function getLiveChatId(videoId) {
       }
     } catch {}
 
-    // ---------------- LAYER 2 ----------------
-    if (!continuation) {
-      try {
-        const res = await fetch(
-          "https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?prettyPrint=false",
-          {
-            method: "POST",
-            headers,
-            body: JSON.stringify({
-              context: {
-                client: {
-                  clientName: "WEB",
-                  clientVersion: "2.2024"
-                }
-              },
-              continuation: ""
-            })
-          }
-        );
-
-        const data = await res.json();
-
-        continuation =
-          data?.continuationContents?.liveChatContinuation
-            ?.continuations?.[0]?.timedContinuationData?.continuation;
-      } catch {}
-    }
-
-    // ---------------- LAYER 3 (HTML fallback) ----------------
+    // Layer 2: HTML fallback
     if (!continuation) {
       try {
         const html = await fetch(
@@ -100,9 +73,7 @@ async function getLiveChatId(videoId) {
 
         const match = html.match(/"continuation":"(.*?)"/);
 
-        if (match?.[1]) {
-          continuation = match[1];
-        }
+        if (match?.[1]) continuation = match[1];
       } catch {}
     }
 
@@ -117,24 +88,17 @@ async function getLiveChatId(videoId) {
 }
 
 // ======================================================
-// WAIT LOOP (SMART + NON-SPAM)
+// WAIT FOR CHAT
 // ======================================================
 async function waitForChat(videoId) {
-  let attempts = 0;
-
   console.log(`⏳ Detecting live chat: ${videoId}`);
 
   while (!liveChats.has(videoId)) {
     const ok = await getLiveChatId(videoId);
-    attempts++;
 
     if (ok) {
       console.log(`✔ LIVE CHAT READY: ${videoId}`);
       return;
-    }
-
-    if (attempts % 6 === 0) {
-      console.log(`⏳ still detecting... (${attempts * 10}s)`);
     }
 
     await sleep(10000);
@@ -154,7 +118,7 @@ async function notify(user, msg, videoId) {
 }
 
 // ======================================================
-// POLLER (RESILIENT)
+// POLLER (FINAL FIXED VERSION)
 // ======================================================
 async function poll(videoId, continuation) {
   let token = continuation;
@@ -184,9 +148,13 @@ async function poll(videoId, continuation) {
         data?.continuationContents?.liveChatContinuation?.actions || [];
 
       for (const a of actions) {
-        const msg =
-          a?.replayChatItemAction?.actions?.[0]
-            ?.addChatItemAction?.item?.liveChatTextMessageRenderer;
+
+        // 🔥 FIX: handle BOTH live + replay
+        const item =
+          a?.addChatItemAction?.item ||
+          a?.replayChatItemAction?.actions?.[0]?.addChatItemAction?.item;
+
+        const msg = item?.liveChatTextMessageRenderer;
 
         if (!msg) continue;
 
@@ -194,19 +162,26 @@ async function poll(videoId, continuation) {
         if (seen.has(id)) continue;
         seen.add(id);
 
-        const text = msg.message?.runs?.map(r => r.text).join("") || "";
+        const text =
+          msg.message?.runs?.map(r => r.text).join("") || "";
+
         const user = msg.authorName?.simpleText || "unknown";
         const authorId = msg.authorExternalChannelId;
 
+        // 🔍 DEBUG (you should see this)
+        console.log("RAW:", user, authorId, text);
+
+        // ✅ FILTER
         if (!CHANNEL_IDS.includes(authorId)) continue;
 
+        // anti-spam
         const now = Date.now();
         if (cooldown.get(authorId) && now - cooldown.get(authorId) < 4000)
           continue;
 
         cooldown.set(authorId, now);
 
-        console.log(`🎯 ${user}: ${text}`);
+        console.log(`🎯 MATCH: ${user}: ${text}`);
         await notify(user, text, videoId);
       }
 
@@ -216,7 +191,8 @@ async function poll(videoId, continuation) {
 
       await sleep(POLL_INTERVAL);
 
-    } catch {
+    } catch (err) {
+      console.log("poll error:", err.message);
       await sleep(5000);
     }
   }
@@ -226,12 +202,10 @@ async function poll(videoId, continuation) {
 // START SYSTEM
 // ======================================================
 async function start() {
-  console.log("🚀 BULLETPROOF SYSTEM STARTED");
+  console.log("🚀 SYSTEM STARTED");
 
-  // parallel detection (faster startup)
   VIDEO_IDS.forEach(id => waitForChat(id));
 
-  // start pollers
   setInterval(() => {
     for (const [videoId, cont] of liveChats.entries()) {
       if (!started.has(videoId)) {
@@ -244,13 +218,13 @@ async function start() {
 }
 
 // ======================================================
-// HEALTH CHECK
+// HEALTH
 // ======================================================
 app.get("/status", (req, res) => {
   res.json({
     ok: true,
-    activeStreams: liveChats.size,
-    seenMessages: seen.size
+    streams: liveChats.size,
+    seen: seen.size
   });
 });
 
