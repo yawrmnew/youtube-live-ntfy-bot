@@ -4,142 +4,168 @@ import express from "express";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ================= CONFIG =================
 const VIDEO_IDS = process.env.TARGET_VIDEO_IDS?.split(",") || [];
 const CHANNEL_IDS = process.env.TARGET_CHANNEL_IDS?.split(",") || [];
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
 
 const POLL_INTERVAL = 4000;
-const RECONNECT_INTERVAL = 15000;
-const MAX_RETRY_BACKOFF = 60000;
 
 // ================= STATE =================
-const state = {
-  chats: new Map(),
-  started: new Set(),
-  seen: new Set(),
-  retryCount: new Map(),
-  queue: []
+const liveChats = new Map();
+const started = new Set();
+const seen = new Set();
+const cooldown = new Map();
+
+// ================= HEADERS =================
+const headers = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+  "Accept": "*/*",
+  "Origin": "https://www.youtube.com",
+  "Referer": "https://www.youtube.com/"
 };
 
-// ================= UTIL =================
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-const log = (type, data) => {
-  console.log(`[${new Date().toISOString()}] [${type}]`, data);
-};
-
-// ================= SAFE JSON =================
+// ======================================================
+// SAFE JSON PARSER
+// ======================================================
 async function safeJson(res) {
   const text = await res.text();
   return JSON.parse(text.replace(/^\)\]\}'\s*\n?/, ""));
 }
 
-// ================= CHAT DISCOVERY =================
+// ======================================================
+// LAYER 1 + 2 + 3 LIVE CHAT DETECTION
+// ======================================================
 async function getLiveChatId(videoId) {
   try {
-    const res = await fetch(
-      `https://www.youtube.com/watch?v=${videoId}&pbj=1`
-    );
-
-    const data = await safeJson(res);
-    const blocks = Array.isArray(data) ? data : [data];
-
     let continuation = null;
 
-    for (const d of blocks) {
-      continuation =
-        d?.response?.contents?.twoColumnWatchNextResults
-          ?.conversationBar?.liveChatRenderer?.continuations?.[0]
-          ?.reloadContinuationData?.continuation;
+    // ---------------- LAYER 1 ----------------
+    try {
+      const res = await fetch(
+        `https://www.youtube.com/watch?v=${videoId}&pbj=1`,
+        { headers }
+      );
 
-      if (continuation) break;
+      const data = await safeJson(res);
+      const blocks = Array.isArray(data) ? data : [data];
+
+      for (const d of blocks) {
+        continuation =
+          d?.response?.contents?.twoColumnWatchNextResults
+            ?.conversationBar?.liveChatRenderer?.continuations?.[0]
+            ?.reloadContinuationData?.continuation;
+
+        if (continuation) break;
+      }
+    } catch {}
+
+    // ---------------- LAYER 2 ----------------
+    if (!continuation) {
+      try {
+        const res = await fetch(
+          "https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?prettyPrint=false",
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              context: {
+                client: {
+                  clientName: "WEB",
+                  clientVersion: "2.2024"
+                }
+              },
+              continuation: ""
+            })
+          }
+        );
+
+        const data = await res.json();
+
+        continuation =
+          data?.continuationContents?.liveChatContinuation
+            ?.continuations?.[0]?.timedContinuationData?.continuation;
+      } catch {}
     }
 
-    if (!continuation) throw new Error("NO_CHAT_FOUND");
+    // ---------------- LAYER 3 (HTML fallback) ----------------
+    if (!continuation) {
+      try {
+        const html = await fetch(
+          `https://www.youtube.com/watch?v=${videoId}`,
+          { headers }
+        ).then(r => r.text());
 
-    state.chats.set(videoId, continuation);
-    state.retryCount.set(videoId, 0);
+        const match = html.match(/"continuation":"(.*?)"/);
 
-    log("CHAT_READY", videoId);
+        if (match?.[1]) {
+          continuation = match[1];
+        }
+      } catch {}
+    }
+
+    if (!continuation) return false;
+
+    liveChats.set(videoId, continuation);
     return true;
 
-  } catch (err) {
-    const count = (state.retryCount.get(videoId) || 0) + 1;
-    state.retryCount.set(videoId, count);
-
-    const backoff = Math.min(5000 * count, MAX_RETRY_BACKOFF);
-
-    log("CHAT_FAIL", {
-      videoId,
-      retry: count,
-      backoff
-    });
-
-    await sleep(backoff);
+  } catch {
     return false;
   }
 }
 
-// ================= SELF-HEALING WATCHDOG =================
-async function watchdog(videoId) {
-  while (true) {
-    if (!state.chats.has(videoId)) {
-      await getLiveChatId(videoId);
+// ======================================================
+// WAIT LOOP (SMART + NON-SPAM)
+// ======================================================
+async function waitForChat(videoId) {
+  let attempts = 0;
+
+  console.log(`⏳ Detecting live chat: ${videoId}`);
+
+  while (!liveChats.has(videoId)) {
+    const ok = await getLiveChatId(videoId);
+    attempts++;
+
+    if (ok) {
+      console.log(`✔ LIVE CHAT READY: ${videoId}`);
+      return;
     }
 
-    await sleep(RECONNECT_INTERVAL);
+    if (attempts % 6 === 0) {
+      console.log(`⏳ still detecting... (${attempts * 10}s)`);
+    }
+
+    await sleep(10000);
   }
 }
 
-// ================= NTFY QUEUE =================
-async function processQueue() {
-  while (true) {
-    if (state.queue.length > 0) {
-      const msg = state.queue.shift();
-
-      try {
-        await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
-          method: "POST",
-          body: msg
-        });
-
-        log("NTFY_OK", msg);
-
-      } catch (err) {
-        log("NTFY_FAIL", err.message);
-        state.queue.push(msg); // retry
-      }
-    }
-
-    await sleep(1000);
-  }
+// ======================================================
+// NOTIFY
+// ======================================================
+async function notify(user, msg, videoId) {
+  try {
+    await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
+      method: "POST",
+      body: `📺 ${videoId}\n👤 ${user}\n💬 ${msg}`
+    });
+  } catch {}
 }
 
-// ================= NOTIFY =================
-function notify(user, text, videoId) {
-  state.queue.push(`📺 ${videoId}\n👤 ${user}\n💬 ${text}`);
-}
+// ======================================================
+// POLLER (RESILIENT)
+// ======================================================
+async function poll(videoId, continuation) {
+  let token = continuation;
 
-// ================= POLLER =================
-async function poll(videoId) {
   while (true) {
-    const continuation = state.chats.get(videoId);
-
-    if (!continuation) {
-      log("RECONNECT", videoId);
-      await sleep(5000);
-      continue;
-    }
-
     try {
       const res = await fetch(
         "https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?prettyPrint=false",
         {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
+          headers,
           body: JSON.stringify({
             context: {
               client: {
@@ -147,7 +173,7 @@ async function poll(videoId) {
                 clientVersion: "2.2024"
               }
             },
-            continuation
+            continuation: token
           })
         }
       );
@@ -165,67 +191,70 @@ async function poll(videoId) {
         if (!msg) continue;
 
         const id = msg.id;
-        if (state.seen.has(id)) continue;
-        state.seen.add(id);
+        if (seen.has(id)) continue;
+        seen.add(id);
 
         const text = msg.message?.runs?.map(r => r.text).join("") || "";
         const user = msg.authorName?.simpleText || "unknown";
         const authorId = msg.authorExternalChannelId;
 
-        if (CHANNEL_IDS.length && authorId && !CHANNEL_IDS.includes(authorId)) {
+        if (!CHANNEL_IDS.includes(authorId)) continue;
+
+        const now = Date.now();
+        if (cooldown.get(authorId) && now - cooldown.get(authorId) < 4000)
           continue;
-        }
 
-        log("MSG", { user, text });
+        cooldown.set(authorId, now);
 
-        notify(user, text, videoId);
+        console.log(`🎯 ${user}: ${text}`);
+        await notify(user, text, videoId);
       }
 
-      const newToken =
+      token =
         data?.continuationContents?.liveChatContinuation
           ?.continuations?.[0]?.timedContinuationData?.continuation;
 
-      if (newToken) {
-        state.chats.set(videoId, newToken);
-      }
-
       await sleep(POLL_INTERVAL);
 
-    } catch (err) {
-      log("POLL_ERROR", err.message);
-
-      // 🔥 SELF HEAL: reset chat state
-      state.chats.delete(videoId);
-
+    } catch {
       await sleep(5000);
     }
   }
 }
 
-// ================= BOOTSTRAP =================
+// ======================================================
+// START SYSTEM
+// ======================================================
 async function start() {
-  log("SYSTEM", "SELF-HEALING ENGINE STARTED");
+  console.log("🚀 BULLETPROOF SYSTEM STARTED");
 
-  // start queue processor
-  processQueue();
+  // parallel detection (faster startup)
+  VIDEO_IDS.forEach(id => waitForChat(id));
 
-  // start watchdog + pollers
-  for (const id of VIDEO_IDS) {
-    watchdog(id);
-    poll(id);
-  }
+  // start pollers
+  setInterval(() => {
+    for (const [videoId, cont] of liveChats.entries()) {
+      if (!started.has(videoId)) {
+        started.add(videoId);
+        console.log(`▶ STARTING: ${videoId}`);
+        poll(videoId, cont);
+      }
+    }
+  }, 2000);
 }
 
-// ================= HEALTH =================
+// ======================================================
+// HEALTH CHECK
+// ======================================================
 app.get("/status", (req, res) => {
   res.json({
-    chats: state.chats.size,
-    queue: state.queue.length,
-    seen: state.seen.size
+    ok: true,
+    activeStreams: liveChats.size,
+    seenMessages: seen.size
   });
 });
 
 app.listen(PORT, () => {
-  log("SERVER", `Running on ${PORT}`);
+  console.log(`🌐 Running on ${PORT}`);
   start();
 });
