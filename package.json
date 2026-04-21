@@ -1,8 +1,6 @@
 {
-  "name": "youtube-live-ntfy-bot",
+  "name": "youtube-live-no-key",
   "version": "1.0.0",
-  "description": "YouTube Live Chat Notifier",
-  "main": "index.js",
   "type": "module",
   "scripts": {
     "start": "node index.js"
