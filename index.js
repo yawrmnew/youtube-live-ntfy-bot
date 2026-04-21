@@ -11,7 +11,7 @@ const NTFY_TOPIC = process.env.NTFY_TOPIC;
 const POLL_INTERVAL = 4000;
 
 // ================= STATE =================
-const liveChats = new Map();        // videoId -> continuation
+const liveChats = new Map();
 const started = new Set();
 const seen = new Set();
 const cooldown = new Map();
@@ -22,14 +22,33 @@ const headers = {
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
   "Accept": "*/*",
   "Origin": "https://www.youtube.com",
-  "Referer": "https://www.youtube.com/"
+  "Referer": "https://www.youtube.com/",
+  "Accept-Language": "en-US,en;q=0.9",
+  "X-YouTube-Client-Name": "1",
+  "X-YouTube-Client-Version": "2.2024"
 };
 
 // ================= UTIL =================
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ======================================================
-// 1. GET LIVE CHAT (ROBUST INNERTUBE WATCH METHOD)
+// FIXED: SAFE JSON PARSING (handles )]}'
+// ======================================================
+async function safeJsonFromResponse(res) {
+  const text = await res.text();
+
+  // YouTube anti-XSSI prefix (robust removal)
+  const cleaned = text.replace(/^\)\]\}'\s*\n?/, "");
+
+  try {
+    return JSON.parse(cleaned);
+  } catch (e) {
+    throw new Error("Invalid JSON after cleanup");
+  }
+}
+
+// ======================================================
+// GET LIVE CHAT ID (ROBUST MULTI-FALLBACK)
 // ======================================================
 async function getLiveChatId(videoId) {
   try {
@@ -38,10 +57,11 @@ async function getLiveChatId(videoId) {
       { headers }
     );
 
-    const data = await res.json();
+    const data = await safeJsonFromResponse(res);
 
     let continuation = null;
 
+    // ================= PRIMARY PATH =================
     for (const d of data) {
       const chat =
         d?.response?.contents?.twoColumnWatchNextResults
@@ -51,6 +71,20 @@ async function getLiveChatId(videoId) {
       if (chat) {
         continuation = chat;
         break;
+      }
+    }
+
+    // ================= FALLBACK PATH =================
+    if (!continuation) {
+      for (const d of data) {
+        const chat =
+          d?.response?.continuationContents?.liveChatContinuation
+            ?.continuations?.[0]?.timedContinuationData?.continuation;
+
+        if (chat) {
+          continuation = chat;
+          break;
+        }
       }
     }
 
@@ -64,12 +98,12 @@ async function getLiveChatId(videoId) {
     console.log(`✔ LIVE CHAT READY for ${videoId}`);
 
   } catch (err) {
-    console.error("getLiveChatId error:", err.message);
+    console.log(`getLiveChatId error (${videoId}):`, err.message);
   }
 }
 
 // ======================================================
-// 2. NTFY
+// NTFY
 // ======================================================
 async function notify(user, msg, videoId) {
   try {
@@ -81,7 +115,7 @@ async function notify(user, msg, videoId) {
 }
 
 // ======================================================
-// 3. POLL CHAT (INNERTUBE LIVE)
+// POLL CHAT
 // ======================================================
 async function poll(videoId, continuation) {
   let token = continuation;
@@ -121,7 +155,9 @@ async function poll(videoId, continuation) {
         if (seen.has(id)) continue;
         seen.add(id);
 
-        const text = msg.message?.runs?.map(r => r.text).join("") || "";
+        const text =
+          msg.message?.runs?.map(r => r.text).join("") || "";
+
         const user = msg.authorName?.simpleText || "unknown";
         const authorId = msg.authorExternalChannelId;
 
@@ -134,6 +170,7 @@ async function poll(videoId, continuation) {
         cooldown.set(authorId, now);
 
         console.log(`🎯 ${user}: ${text}`);
+
         await notify(user, text, videoId);
       }
 
@@ -151,17 +188,17 @@ async function poll(videoId, continuation) {
 }
 
 // ======================================================
-// 4. START SYSTEM
+// START SYSTEM
 // ======================================================
 async function start() {
   console.log("🚀 NO-KEY SYSTEM STARTED");
 
-  // STEP 1: find chats
+  // STEP 1: initialize chats
   for (const id of VIDEO_IDS) {
     await getLiveChatId(id);
   }
 
-  // STEP 2: retry until ready
+  // STEP 2: retry loop
   setInterval(async () => {
     for (const id of VIDEO_IDS) {
       if (!liveChats.has(id)) {
@@ -183,7 +220,7 @@ async function start() {
 }
 
 // ======================================================
-// 5. STATUS SERVER
+// HEALTH CHECK
 // ======================================================
 app.get("/status", (req, res) => {
   res.json({
