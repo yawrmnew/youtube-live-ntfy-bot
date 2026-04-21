@@ -5,97 +5,86 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ================= CONFIG =================
-const TARGET_VIDEO_IDS = process.env.TARGET_VIDEO_IDS?.split(",") || [];
-const TARGET_CHANNEL_IDS = process.env.TARGET_CHANNEL_IDS?.split(",") || [];
+const VIDEO_IDS = process.env.TARGET_VIDEO_IDS?.split(",") || [];
+const CHANNEL_IDS = process.env.TARGET_CHANNEL_IDS?.split(",") || [];
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
-const POLL_INTERVAL = 3000;
+const POLL_INTERVAL = 4000;
 
 // ================= STATE =================
-const liveChatMap = new Map();
-const startedPollers = new Set();
-const seenMessages = new Set();
+const liveChats = new Map();        // videoId -> continuation
+const started = new Set();
+const seen = new Set();
 const cooldown = new Map();
 
 // ================= HEADERS =================
 const headers = {
-  "Content-Type": "application/json",
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+  "Accept": "*/*",
   "Origin": "https://www.youtube.com",
   "Referer": "https://www.youtube.com/"
 };
 
 // ================= UTIL =================
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-function cleanCache() {
-  if (seenMessages.size > 10000) {
-    const keep = Array.from(seenMessages).slice(-5000);
-    seenMessages.clear();
-    keep.forEach((m) => seenMessages.add(m));
-  }
-}
-
-// ================= SAFE LIVE CHAT FETCH =================
+// ======================================================
+// 1. GET LIVE CHAT (ROBUST INNERTUBE WATCH METHOD)
+// ======================================================
 async function getLiveChatId(videoId) {
   try {
     const res = await fetch(
-      "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          context: {
-            client: {
-              clientName: "WEB",
-              clientVersion: "2.2024"
-            }
-          },
-          videoId
-        })
-      }
+      `https://www.youtube.com/watch?v=${videoId}&pbj=1`,
+      { headers }
     );
 
     const data = await res.json();
 
-    // ===== TRY MULTIPLE PATHS (YouTube changes often) =====
-    let chatId =
-      data?.liveStreamingDetails?.activeLiveChatId ||
-      data?.engagementPanels?.find(p =>
-        p.engagementPanelSectionListRenderer
-      )?.engagementPanelSectionListRenderer?.content
-        ?.liveChatRenderer?.continuations?.[0]
-        ?.timedContinuationData?.continuation;
+    let continuation = null;
 
-    if (!chatId) {
+    for (const d of data) {
+      const chat =
+        d?.response?.contents?.twoColumnWatchNextResults
+          ?.conversationBar?.liveChatRenderer?.continuations?.[0]
+          ?.reloadContinuationData?.continuation;
+
+      if (chat) {
+        continuation = chat;
+        break;
+      }
+    }
+
+    if (!continuation) {
       console.log(`⏳ No live chat yet for ${videoId}`);
       return;
     }
 
-    liveChatMap.set(videoId, chatId);
+    liveChats.set(videoId, continuation);
 
-    console.log(`✔ LiveChat READY for ${videoId}`);
+    console.log(`✔ LIVE CHAT READY for ${videoId}`);
 
   } catch (err) {
     console.error("getLiveChatId error:", err.message);
   }
 }
 
-// ================= NOTIFY =================
+// ======================================================
+// 2. NTFY
+// ======================================================
 async function notify(user, msg, videoId) {
   try {
     await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
       method: "POST",
       body: `📺 ${videoId}\n👤 ${user}\n💬 ${msg}`
     });
-  } catch (err) {
-    console.error("ntfy error:", err.message);
-  }
+  } catch {}
 }
 
-// ================= POLL CHAT =================
-async function pollChat(videoId, chatId) {
-  let continuation = chatId;
+// ======================================================
+// 3. POLL CHAT (INNERTUBE LIVE)
+// ======================================================
+async function poll(videoId, continuation) {
+  let token = continuation;
 
   while (true) {
     try {
@@ -111,7 +100,7 @@ async function pollChat(videoId, chatId) {
                 clientVersion: "2.2024"
               }
             },
-            continuation
+            continuation: token
           })
         }
       );
@@ -121,85 +110,86 @@ async function pollChat(videoId, chatId) {
       const actions =
         data?.continuationContents?.liveChatContinuation?.actions || [];
 
-      for (const action of actions) {
+      for (const a of actions) {
         const msg =
-          action?.replayChatItemAction?.actions?.[0]
+          a?.replayChatItemAction?.actions?.[0]
             ?.addChatItemAction?.item?.liveChatTextMessageRenderer;
 
         if (!msg) continue;
 
         const id = msg.id;
-        const text =
-          msg.message?.runs?.map(r => r.text).join("") || "";
+        if (seen.has(id)) continue;
+        seen.add(id);
+
+        const text = msg.message?.runs?.map(r => r.text).join("") || "";
         const user = msg.authorName?.simpleText || "unknown";
         const authorId = msg.authorExternalChannelId;
 
-        if (seenMessages.has(id)) continue;
-        seenMessages.add(id);
-
-        if (!TARGET_CHANNEL_IDS.includes(authorId)) continue;
+        if (!CHANNEL_IDS.includes(authorId)) continue;
 
         const now = Date.now();
-        const last = cooldown.get(authorId) || 0;
-        if (now - last < 5000) continue;
+        if (cooldown.get(authorId) && now - cooldown.get(authorId) < 5000)
+          continue;
+
         cooldown.set(authorId, now);
 
         console.log(`🎯 ${user}: ${text}`);
-
         await notify(user, text, videoId);
       }
 
-      continuation =
+      token =
         data?.continuationContents?.liveChatContinuation
           ?.continuations?.[0]?.timedContinuationData?.continuation;
-
-      cleanCache();
 
       await sleep(POLL_INTERVAL);
 
     } catch (err) {
-      console.error(`poll error (${videoId}):`, err.message);
+      console.log(`poll error (${videoId}):`, err.message);
       await sleep(5000);
     }
   }
 }
 
-// ================= START SYSTEM =================
+// ======================================================
+// 4. START SYSTEM
+// ======================================================
 async function start() {
-  console.log("🚀 NO-KEY system starting...");
+  console.log("🚀 NO-KEY SYSTEM STARTED");
 
-  // Step 1: resolve all live chats
-  for (const id of TARGET_VIDEO_IDS) {
+  // STEP 1: find chats
+  for (const id of VIDEO_IDS) {
     await getLiveChatId(id);
   }
 
-  // Step 2: retry until live chat becomes available
+  // STEP 2: retry until ready
   setInterval(async () => {
-    for (const id of TARGET_VIDEO_IDS) {
-      if (!liveChatMap.has(id)) {
+    for (const id of VIDEO_IDS) {
+      if (!liveChats.has(id)) {
         await getLiveChatId(id);
       }
     }
   }, 15000);
 
-  // Step 3: start pollers safely (FIXED)
+  // STEP 3: start pollers
   setInterval(() => {
-    for (const [videoId, chatId] of liveChatMap.entries()) {
-      if (!startedPollers.has(videoId)) {
-        startedPollers.add(videoId);
-        console.log(`▶ Starting poller for ${videoId}`);
-        pollChat(videoId, chatId);
+    for (const [videoId, cont] of liveChats.entries()) {
+      if (!started.has(videoId)) {
+        started.add(videoId);
+        console.log(`▶ STARTING ${videoId}`);
+        poll(videoId, cont);
       }
     }
   }, 2000);
 }
 
-// ================= HEALTH =================
+// ======================================================
+// 5. STATUS SERVER
+// ======================================================
 app.get("/status", (req, res) => {
   res.json({
-    status: "running",
-    streams: liveChatMap.size,
-    messagesSeen: seenMessages.size
+    ok: true,
+    streams: liveChats.size,
+    seen: seen.size
   });
 });
 
