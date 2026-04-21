@@ -22,24 +22,22 @@ const headers = {
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
   "Accept": "*/*",
   "Origin": "https://www.youtube.com",
-  "Referer": "https://www.youtube.com/",
-  "Accept-Language": "en-US,en;q=0.9"
+  "Referer": "https://www.youtube.com/"
 };
 
 // ================= UTIL =================
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ======================================================
-// SAFE JSON PARSER (handles )]}' prefix)
+// SAFE JSON PARSE (handles )]}'
 // ======================================================
 async function safeJson(res) {
   const text = await res.text();
-  const cleaned = text.replace(/^\)\]\}'\s*\n?/, "");
-  return JSON.parse(cleaned);
+  return JSON.parse(text.replace(/^\)\]\}'\s*\n?/, ""));
 }
 
 // ======================================================
-// GET LIVE CHAT ID (ROBUST + SAFE)
+// GET LIVE CHAT (WAIT-UNTIL-READY STYLE)
 // ======================================================
 async function getLiveChatId(videoId) {
   try {
@@ -50,40 +48,51 @@ async function getLiveChatId(videoId) {
 
     const data = await safeJson(res);
 
-    // Normalize response (IMPORTANT FIX)
     const blocks = Array.isArray(data) ? data : [data];
 
     let continuation = null;
 
     for (const d of blocks) {
-      const chat =
+      continuation =
         d?.response?.contents?.twoColumnWatchNextResults
           ?.conversationBar?.liveChatRenderer?.continuations?.[0]
           ?.reloadContinuationData?.continuation ||
         d?.response?.continuationContents?.liveChatContinuation
           ?.continuations?.[0]?.timedContinuationData?.continuation;
 
-      if (chat) {
-        continuation = chat;
-        break;
-      }
+      if (continuation) break;
     }
 
-    if (!continuation) {
-      console.log(`⏳ No live chat yet for ${videoId}`);
-      return;
-    }
+    if (!continuation) return false;
 
     liveChats.set(videoId, continuation);
-    console.log(`✔ LIVE CHAT READY for ${videoId}`);
+    return true;
 
-  } catch (err) {
-    console.log(`getLiveChatId error (${videoId}):`, err.message);
+  } catch {
+    return false;
   }
 }
 
 // ======================================================
-// NTFY NOTIFICATION
+// WAIT UNTIL LIVE CHAT IS READY (FIXED LOGIC)
+// ======================================================
+async function waitForChat(videoId) {
+  console.log(`⏳ Waiting for live chat: ${videoId}`);
+
+  while (!liveChats.has(videoId)) {
+    const ok = await getLiveChatId(videoId);
+
+    if (ok) {
+      console.log(`✔ LIVE CHAT READY: ${videoId}`);
+      break;
+    }
+
+    await sleep(10000); // IMPORTANT: avoid YouTube throttling
+  }
+}
+
+// ======================================================
+// NOTIFY
 // ======================================================
 async function notify(user, msg, videoId) {
   try {
@@ -95,7 +104,7 @@ async function notify(user, msg, videoId) {
 }
 
 // ======================================================
-// POLL LIVE CHAT
+// POLL CHAT
 // ======================================================
 async function poll(videoId, continuation) {
   let token = continuation;
@@ -135,9 +144,7 @@ async function poll(videoId, continuation) {
         if (seen.has(id)) continue;
         seen.add(id);
 
-        const text =
-          msg.message?.runs?.map(r => r.text).join("") || "";
-
+        const text = msg.message?.runs?.map(r => r.text).join("") || "";
         const user = msg.authorName?.simpleText || "unknown";
         const authorId = msg.authorExternalChannelId;
 
@@ -159,33 +166,24 @@ async function poll(videoId, continuation) {
 
       await sleep(POLL_INTERVAL);
 
-    } catch (err) {
-      console.log(`poll error (${videoId}):`, err.message);
+    } catch {
       await sleep(5000);
     }
   }
 }
 
 // ======================================================
-// START SYSTEM
+// START SYSTEM (FIXED FLOW)
 // ======================================================
 async function start() {
   console.log("🚀 NO-KEY SYSTEM STARTED");
 
+  // STEP 1: WAIT FOR CHAT PROPERLY
   for (const id of VIDEO_IDS) {
-    await getLiveChatId(id);
+    waitForChat(id);
   }
 
-  // retry until chat is ready
-  setInterval(async () => {
-    for (const id of VIDEO_IDS) {
-      if (!liveChats.has(id)) {
-        await getLiveChatId(id);
-      }
-    }
-  }, 15000);
-
-  // start pollers safely
+  // STEP 2: START POLLERS WHEN READY
   setInterval(() => {
     for (const [videoId, cont] of liveChats.entries()) {
       if (!started.has(videoId)) {
@@ -198,7 +196,7 @@ async function start() {
 }
 
 // ======================================================
-// HEALTH CHECK
+// STATUS
 // ======================================================
 app.get("/status", (req, res) => {
   res.json({
