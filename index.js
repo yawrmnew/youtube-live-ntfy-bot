@@ -4,7 +4,7 @@ import express from "express";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ===== ENV CONFIG =====
+// ===== ENV =====
 const API_KEY = process.env.YOUTUBE_API_KEY;
 const TARGET_CHANNEL_IDS = process.env.TARGET_CHANNEL_IDS?.split(",") || [];
 const TARGET_VIDEO_IDS = process.env.TARGET_VIDEO_IDS?.split(",") || [];
@@ -12,29 +12,31 @@ const NTFY_TOPIC = process.env.NTFY_TOPIC;
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || "5000");
 
 // ===== STATE =====
-const liveChatMap = new Map(); // videoId -> liveChatId
-const seenMessages = new Set();
-const userCooldown = new Map(); // anti-spam
+const liveChatMap = new Map();      // videoId -> liveChatId
+const seenMessages = new Set();     // dedup
+const startedPollers = new Set();   // FIX: prevents crash + duplicates
+const userCooldown = new Map();
 
 // ===== UTIL =====
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function cleanOldCache() {
+function cleanCache() {
   if (seenMessages.size > 10000) {
-    const arr = Array.from(seenMessages).slice(-5000);
+    const keep = Array.from(seenMessages).slice(-5000);
     seenMessages.clear();
-    arr.forEach((id) => seenMessages.add(id));
+    keep.forEach((m) => seenMessages.add(m));
   }
 }
 
-// ===== FETCH LIVE CHAT ID =====
+// ===== GET LIVE CHAT ID =====
 async function getLiveChatId(videoId) {
   try {
     const url = `https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id=${videoId}&key=${API_KEY}`;
     const res = await fetch(url);
     const data = await res.json();
 
-    const chatId = data.items?.[0]?.liveStreamingDetails?.activeLiveChatId;
+    const item = data.items?.[0];
+    const chatId = item?.liveStreamingDetails?.activeLiveChatId;
 
     if (chatId) {
       liveChatMap.set(videoId, chatId);
@@ -43,12 +45,12 @@ async function getLiveChatId(videoId) {
       console.log(`⏳ Waiting for live chat: ${videoId}`);
     }
   } catch (err) {
-    console.error("Error fetching liveChatId:", err.message);
+    console.error("getLiveChatId error:", err.message);
   }
 }
 
-// ===== SEND NOTIFICATION =====
-async function sendNotification(username, message, videoId) {
+// ===== NOTIFY =====
+async function notify(username, message, videoId) {
   try {
     await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
       method: "POST",
@@ -59,13 +61,14 @@ async function sendNotification(username, message, videoId) {
   }
 }
 
-// ===== PROCESS MESSAGES =====
+// ===== POLL CHAT =====
 async function pollChat(videoId, liveChatId) {
   let pageToken = "";
 
   while (true) {
     try {
       const url = `https://www.googleapis.com/youtube/v3/liveChat/messages?liveChatId=${liveChatId}&part=snippet,authorDetails&pageToken=${pageToken}&key=${API_KEY}`;
+
       const res = await fetch(url);
       const data = await res.json();
 
@@ -74,19 +77,19 @@ async function pollChat(videoId, liveChatId) {
         continue;
       }
 
-      for (const item of data.items) {
-        const messageId = item.id;
-        const authorId = item.authorDetails.channelId;
+      for (const msg of data.items) {
+        const msgId = msg.id;
+        const authorId = msg.authorDetails.channelId;
 
-        if (seenMessages.has(messageId)) continue;
-        seenMessages.add(messageId);
+        if (seenMessages.has(msgId)) continue;
+        seenMessages.add(msgId);
 
         if (!TARGET_CHANNEL_IDS.includes(authorId)) continue;
 
-        const username = item.authorDetails.displayName;
-        const message = item.snippet.displayMessage;
+        const username = msg.authorDetails.displayName;
+        const text = msg.snippet.displayMessage;
 
-        // ===== Anti-spam cooldown =====
+        // anti-spam cooldown
         const now = Date.now();
         const last = userCooldown.get(authorId) || 0;
         if (now - last < 5000) continue;
@@ -94,29 +97,30 @@ async function pollChat(videoId, liveChatId) {
 
         console.log(`🎯 Match: ${username} in ${videoId}`);
 
-        await sendNotification(username, message, videoId);
+        await notify(username, text, videoId);
       }
 
       pageToken = data.nextPageToken;
-      cleanOldCache();
+      cleanCache();
 
       await sleep(POLL_INTERVAL);
     } catch (err) {
-      console.error(`Polling error (${videoId}):`, err.message);
+      console.error(`poll error (${videoId}):`, err.message);
       await sleep(5000);
     }
   }
 }
 
-// ===== INIT SYSTEM =====
+// ===== START SYSTEM =====
 async function start() {
   console.log("🚀 Starting system...");
 
+  // initial fetch
   for (const videoId of TARGET_VIDEO_IDS) {
     await getLiveChatId(videoId);
   }
 
-  // Retry fetching chat IDs every 30s if missing
+  // retry missing chat IDs
   setInterval(async () => {
     for (const videoId of TARGET_VIDEO_IDS) {
       if (!liveChatMap.has(videoId)) {
@@ -125,25 +129,25 @@ async function start() {
     }
   }, 30000);
 
-  // Start polling each chat
+  // START POLLERS (FIXED)
   setInterval(() => {
     for (const [videoId, chatId] of liveChatMap.entries()) {
-      if (!chatId._started) {
-        chatId._started = true;
+      if (!startedPollers.has(videoId)) {
+        startedPollers.add(videoId);
+        console.log(`▶ Starting poller for ${videoId}`);
         pollChat(videoId, chatId);
       }
     }
   }, 2000);
 }
 
-// ===== HEALTH CHECK =====
+// ===== STATUS ENDPOINT =====
 app.get("/status", (req, res) => {
   res.json({
     status: "running",
     videos: TARGET_VIDEO_IDS.length,
-    users: TARGET_CHANNEL_IDS.length,
     activeChats: liveChatMap.size,
-    cacheSize: seenMessages.size,
+    seenMessages: seenMessages.size,
   });
 });
 
