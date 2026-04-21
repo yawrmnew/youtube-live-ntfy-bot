@@ -4,10 +4,10 @@ import express from "express";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ================= CONFIG =================
 const VIDEO_IDS = process.env.TARGET_VIDEO_IDS?.split(",") || [];
 const CHANNEL_IDS = process.env.TARGET_CHANNEL_IDS?.split(",") || [];
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
+
 const POLL_INTERVAL = 5000;
 
 // ================= STATE =================
@@ -25,11 +25,10 @@ const headers = {
   "Referer": "https://www.youtube.com/"
 };
 
-// ================= UTIL =================
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ======================================================
-// SAFE JSON PARSE (handles )]}'
+// SAFE JSON PARSER
 // ======================================================
 async function safeJson(res) {
   const text = await res.text();
@@ -37,7 +36,7 @@ async function safeJson(res) {
 }
 
 // ======================================================
-// GET LIVE CHAT (WAIT-UNTIL-READY STYLE)
+// MULTI-SOURCE LIVE CHAT DETECTION (FIXED CORE)
 // ======================================================
 async function getLiveChatId(videoId) {
   try {
@@ -47,7 +46,6 @@ async function getLiveChatId(videoId) {
     );
 
     const data = await safeJson(res);
-
     const blocks = Array.isArray(data) ? data : [data];
 
     let continuation = null;
@@ -58,6 +56,8 @@ async function getLiveChatId(videoId) {
           ?.conversationBar?.liveChatRenderer?.continuations?.[0]
           ?.reloadContinuationData?.continuation ||
         d?.response?.continuationContents?.liveChatContinuation
+          ?.continuations?.[0]?.timedContinuationData?.continuation ||
+        d?.continuationContents?.liveChatContinuation
           ?.continuations?.[0]?.timedContinuationData?.continuation;
 
       if (continuation) break;
@@ -74,20 +74,28 @@ async function getLiveChatId(videoId) {
 }
 
 // ======================================================
-// WAIT UNTIL LIVE CHAT IS READY (FIXED LOGIC)
+// SMART WAIT (NO SILENT FREEZE)
 // ======================================================
 async function waitForChat(videoId) {
-  console.log(`⏳ Waiting for live chat: ${videoId}`);
+  let attempts = 0;
+
+  console.log(`⏳ Detecting live chat: ${videoId}`);
 
   while (!liveChats.has(videoId)) {
     const ok = await getLiveChatId(videoId);
+    attempts++;
 
     if (ok) {
-      console.log(`✔ LIVE CHAT READY: ${videoId}`);
-      break;
+      console.log(`✔ LIVE CHAT FOUND: ${videoId}`);
+      return;
     }
 
-    await sleep(10000); // IMPORTANT: avoid YouTube throttling
+    // progress feedback (prevents "stuck" feeling)
+    if (attempts % 6 === 0) {
+      console.log(`⏳ still detecting... (${attempts * 10}s)`);
+    }
+
+    await sleep(10000);
   }
 }
 
@@ -104,7 +112,7 @@ async function notify(user, msg, videoId) {
 }
 
 // ======================================================
-// POLL CHAT
+// POLLER
 // ======================================================
 async function poll(videoId, continuation) {
   let token = continuation;
@@ -173,22 +181,20 @@ async function poll(videoId, continuation) {
 }
 
 // ======================================================
-// START SYSTEM (FIXED FLOW)
+// START SYSTEM
 // ======================================================
 async function start() {
   console.log("🚀 NO-KEY SYSTEM STARTED");
 
-  // STEP 1: WAIT FOR CHAT PROPERLY
-  for (const id of VIDEO_IDS) {
-    waitForChat(id);
-  }
+  // start detection in parallel (IMPORTANT FIX)
+  VIDEO_IDS.forEach(id => waitForChat(id));
 
-  // STEP 2: START POLLERS WHEN READY
+  // start polling when ready
   setInterval(() => {
     for (const [videoId, cont] of liveChats.entries()) {
       if (!started.has(videoId)) {
         started.add(videoId);
-        console.log(`▶ STARTING ${videoId}`);
+        console.log(`▶ STARTING POLLER: ${videoId}`);
         poll(videoId, cont);
       }
     }
@@ -196,13 +202,13 @@ async function start() {
 }
 
 // ======================================================
-// STATUS
+// STATUS ENDPOINT
 // ======================================================
 app.get("/status", (req, res) => {
   res.json({
     ok: true,
-    streams: liveChats.size,
-    seen: seen.size
+    activeChats: liveChats.size,
+    seenMessages: seen.size
   });
 });
 
