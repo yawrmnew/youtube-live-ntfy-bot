@@ -20,7 +20,8 @@ const cooldown = new Map();
 // ================= HEADERS =================
 const headers = {
   "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    "com.google.android.youtube/19.09.37 (Linux; U; Android 11)",
+  "Content-Type": "application/json",
   "Accept": "*/*",
   "Origin": "https://www.youtube.com",
   "Referer": "https://www.youtube.com/"
@@ -37,7 +38,7 @@ async function safeJson(res) {
 }
 
 // ======================================================
-// LIVE CHAT DETECTION (MULTI FALLBACK)
+// LIVE CHAT DETECTION
 // ======================================================
 async function getLiveChatId(videoId) {
   try {
@@ -118,7 +119,7 @@ async function notify(user, msg, videoId) {
 }
 
 // ======================================================
-// POLLER (FINAL FIXED VERSION)
+// POLLER (ANDROID FIX APPLIED)
 // ======================================================
 async function poll(videoId, continuation) {
   let token = continuation;
@@ -133,8 +134,9 @@ async function poll(videoId, continuation) {
           body: JSON.stringify({
             context: {
               client: {
-                clientName: "WEB",
-                clientVersion: "2.2024"
+                clientName: "ANDROID",
+                clientVersion: "19.09.37",
+                androidSdkVersion: 30
               }
             },
             continuation: token
@@ -147,9 +149,11 @@ async function poll(videoId, continuation) {
       const actions =
         data?.continuationContents?.liveChatContinuation?.actions || [];
 
+      // 🔍 DEBUG
+      console.log("ACTIONS LENGTH:", actions.length);
+
       for (const a of actions) {
 
-        // 🔥 FIX: handle BOTH live + replay
         const item =
           a?.addChatItemAction?.item ||
           a?.replayChatItemAction?.actions?.[0]?.addChatItemAction?.item;
@@ -168,10 +172,10 @@ async function poll(videoId, continuation) {
         const user = msg.authorName?.simpleText || "unknown";
         const authorId = msg.authorExternalChannelId;
 
-        // 🔍 DEBUG (you should see this)
+        // 🔍 DEBUG
         console.log("RAW:", user, authorId, text);
 
-        // ✅ FILTER
+        // FILTER
         if (!CHANNEL_IDS.includes(authorId)) continue;
 
         // anti-spam
