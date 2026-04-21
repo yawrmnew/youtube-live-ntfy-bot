@@ -4,11 +4,11 @@ import express from "express";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ================= CONFIG =================
 const VIDEO_IDS = process.env.TARGET_VIDEO_IDS?.split(",") || [];
 const CHANNEL_IDS = process.env.TARGET_CHANNEL_IDS?.split(",") || [];
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
-
-const POLL_INTERVAL = 4000;
+const POLL_INTERVAL = 5000;
 
 // ================= STATE =================
 const liveChats = new Map();
@@ -25,10 +25,11 @@ const headers = {
   "Referer": "https://www.youtube.com/"
 };
 
+// ================= UTIL =================
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ======================================================
-// SAFE JSON PARSER
+// SAFE JSON PARSE (handles )]}'
 // ======================================================
 async function safeJson(res) {
   const text = await res.text();
@@ -36,74 +37,30 @@ async function safeJson(res) {
 }
 
 // ======================================================
-// LAYER 1 + 2 + 3 LIVE CHAT DETECTION
+// GET LIVE CHAT (WAIT-UNTIL-READY STYLE)
 // ======================================================
 async function getLiveChatId(videoId) {
   try {
+    const res = await fetch(
+      `https://www.youtube.com/watch?v=${videoId}&pbj=1`,
+      { headers }
+    );
+
+    const data = await safeJson(res);
+
+    const blocks = Array.isArray(data) ? data : [data];
+
     let continuation = null;
 
-    // ---------------- LAYER 1 ----------------
-    try {
-      const res = await fetch(
-        `https://www.youtube.com/watch?v=${videoId}&pbj=1`,
-        { headers }
-      );
+    for (const d of blocks) {
+      continuation =
+        d?.response?.contents?.twoColumnWatchNextResults
+          ?.conversationBar?.liveChatRenderer?.continuations?.[0]
+          ?.reloadContinuationData?.continuation ||
+        d?.response?.continuationContents?.liveChatContinuation
+          ?.continuations?.[0]?.timedContinuationData?.continuation;
 
-      const data = await safeJson(res);
-      const blocks = Array.isArray(data) ? data : [data];
-
-      for (const d of blocks) {
-        continuation =
-          d?.response?.contents?.twoColumnWatchNextResults
-            ?.conversationBar?.liveChatRenderer?.continuations?.[0]
-            ?.reloadContinuationData?.continuation;
-
-        if (continuation) break;
-      }
-    } catch {}
-
-    // ---------------- LAYER 2 ----------------
-    if (!continuation) {
-      try {
-        const res = await fetch(
-          "https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?prettyPrint=false",
-          {
-            method: "POST",
-            headers,
-            body: JSON.stringify({
-              context: {
-                client: {
-                  clientName: "WEB",
-                  clientVersion: "2.2024"
-                }
-              },
-              continuation: ""
-            })
-          }
-        );
-
-        const data = await res.json();
-
-        continuation =
-          data?.continuationContents?.liveChatContinuation
-            ?.continuations?.[0]?.timedContinuationData?.continuation;
-      } catch {}
-    }
-
-    // ---------------- LAYER 3 (HTML fallback) ----------------
-    if (!continuation) {
-      try {
-        const html = await fetch(
-          `https://www.youtube.com/watch?v=${videoId}`,
-          { headers }
-        ).then(r => r.text());
-
-        const match = html.match(/"continuation":"(.*?)"/);
-
-        if (match?.[1]) {
-          continuation = match[1];
-        }
-      } catch {}
+      if (continuation) break;
     }
 
     if (!continuation) return false;
@@ -117,27 +74,20 @@ async function getLiveChatId(videoId) {
 }
 
 // ======================================================
-// WAIT LOOP (SMART + NON-SPAM)
+// WAIT UNTIL LIVE CHAT IS READY (FIXED LOGIC)
 // ======================================================
 async function waitForChat(videoId) {
-  let attempts = 0;
-
-  console.log(`⏳ Detecting live chat: ${videoId}`);
+  console.log(`⏳ Waiting for live chat: ${videoId}`);
 
   while (!liveChats.has(videoId)) {
     const ok = await getLiveChatId(videoId);
-    attempts++;
 
     if (ok) {
       console.log(`✔ LIVE CHAT READY: ${videoId}`);
-      return;
+      break;
     }
 
-    if (attempts % 6 === 0) {
-      console.log(`⏳ still detecting... (${attempts * 10}s)`);
-    }
-
-    await sleep(10000);
+    await sleep(10000); // IMPORTANT: avoid YouTube throttling
   }
 }
 
@@ -154,7 +104,7 @@ async function notify(user, msg, videoId) {
 }
 
 // ======================================================
-// POLLER (RESILIENT)
+// POLL CHAT
 // ======================================================
 async function poll(videoId, continuation) {
   let token = continuation;
@@ -201,7 +151,7 @@ async function poll(videoId, continuation) {
         if (!CHANNEL_IDS.includes(authorId)) continue;
 
         const now = Date.now();
-        if (cooldown.get(authorId) && now - cooldown.get(authorId) < 4000)
+        if (cooldown.get(authorId) && now - cooldown.get(authorId) < 5000)
           continue;
 
         cooldown.set(authorId, now);
@@ -223,20 +173,22 @@ async function poll(videoId, continuation) {
 }
 
 // ======================================================
-// START SYSTEM
+// START SYSTEM (FIXED FLOW)
 // ======================================================
 async function start() {
-  console.log("🚀 BULLETPROOF SYSTEM STARTED");
+  console.log("🚀 NO-KEY SYSTEM STARTED");
 
-  // parallel detection (faster startup)
-  VIDEO_IDS.forEach(id => waitForChat(id));
+  // STEP 1: WAIT FOR CHAT PROPERLY
+  for (const id of VIDEO_IDS) {
+    waitForChat(id);
+  }
 
-  // start pollers
+  // STEP 2: START POLLERS WHEN READY
   setInterval(() => {
     for (const [videoId, cont] of liveChats.entries()) {
       if (!started.has(videoId)) {
         started.add(videoId);
-        console.log(`▶ STARTING: ${videoId}`);
+        console.log(`▶ STARTING ${videoId}`);
         poll(videoId, cont);
       }
     }
@@ -244,13 +196,13 @@ async function start() {
 }
 
 // ======================================================
-// HEALTH CHECK
+// STATUS
 // ======================================================
 app.get("/status", (req, res) => {
   res.json({
     ok: true,
-    activeStreams: liveChats.size,
-    seenMessages: seen.size
+    streams: liveChats.size,
+    seen: seen.size
   });
 });
 
